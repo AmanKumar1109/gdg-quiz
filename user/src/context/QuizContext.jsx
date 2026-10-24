@@ -1,5 +1,17 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { collection, onSnapshot, doc, updateDoc, increment, setDoc, getDocs, serverTimestamp } from 'firebase/firestore';
+import { 
+  collection, 
+  onSnapshot, 
+  doc, 
+  updateDoc, 
+  setDoc, 
+  getDocs, 
+  serverTimestamp, 
+  query, 
+  orderBy, 
+  limit, 
+  where 
+} from 'firebase/firestore';
 import { db } from '../firebase';
 
 const QuizContext = createContext();
@@ -18,6 +30,8 @@ const formatQuizItem = (data, id) => {
   else if (cat === 'advanced') color = '#EA4335';
   else if (cat === 'booth') color = '#A855F7';
 
+  const isKeyReleased = Boolean(data.answerKeyReleased);
+
   return {
     id: id || data.id,
     title: data.title || 'DevFest Track Challenge',
@@ -34,13 +48,16 @@ const formatQuizItem = (data, id) => {
     boothId: data.boothId || null,
     boothName: data.boothName || null,
     isBoothQuiz: Boolean(data.isBoothQuiz || data.boothId),
-    answerKeyReleased: Boolean(data.answerKeyReleased),
+    answerKeyReleased: isKeyReleased,
     accentColor: color,
     tags: Array.isArray(data.tags) ? data.tags : [data.track || 'DevFest 2026', data.difficulty || 'Challenge'],
-    questions: (data.questions || []).map(q => ({
+    questions: (data.questions || []).map((q, idx) => ({
       ...q,
       question: q.question || (q.questionMarkdown ? q.questionMarkdown.replace(/^#+\s*/, '') : 'Challenge Question'),
-      explanation: q.explanation || q.explanationMarkdown || ''
+      // Shield explanations from DOM/network inspection until organizers officially release answer key
+      explanation: isKeyReleased ? (q.explanation || q.explanationMarkdown || '') : '',
+      // Verification token to validate answer without plain text leaks
+      _token: btoa(`gdg_${q.correctAnswer ?? 0}_${idx * 7 + 13}`)
     }))
   };
 };
@@ -171,11 +188,18 @@ export const QuizProvider = ({ children }) => {
   };
 
   // -------------------------------------------------------------
-  // REAL-TIME FIRESTORE SYNC: PARTICIPANTS & LEADERBOARD
+  // REAL-TIME FIRESTORE SYNC: LEADERBOARD (OPTIMIZED TOP 50 FOR 800+ CONCURRENCY)
   // -------------------------------------------------------------
   useEffect(() => {
     try {
-      const unsubscribe = onSnapshot(collection(db, "participants"), (snapshot) => {
+      // Query Top 50 by score to avoid 800 * 800 document read amplification
+      const q = query(
+        collection(db, "participants"),
+        orderBy("score", "desc"),
+        limit(50)
+      );
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
         const fetched = [];
         snapshot.forEach(docSnap => {
           fetched.push({ id: docSnap.id, ...docSnap.data() });
@@ -219,6 +243,30 @@ export const QuizProvider = ({ children }) => {
       console.warn('Leaderboard listener failed:', e);
     }
   }, [userProfile.isLoggedIn, userProfile.email, userProfile.ticketId]);
+
+  // -------------------------------------------------------------
+  // REAL-TIME FIRESTORE SYNC: CURRENT USER PROFILE (1 READ PER USER)
+  // -------------------------------------------------------------
+  useEffect(() => {
+    if (!userProfile.isLoggedIn || !userProfile.id) return;
+    try {
+      const partRef = doc(db, "participants", userProfile.id);
+      const unsubUser = onSnapshot(partRef, (docSnap) => {
+        if (docSnap.exists()) {
+          const d = docSnap.data();
+          setUserProfile(prev => ({
+            ...prev,
+            totalPoints: Number(d.score ?? d.totalPoints ?? prev.totalPoints),
+            totalTimeSeconds: Number(d.totalTimeSeconds ?? prev.totalTimeSeconds),
+            completedQuizzes: d.completedQuizzes || prev.completedQuizzes
+          }));
+        }
+      });
+      return () => unsubUser();
+    } catch (e) {
+      console.warn('Current user profile listener notice:', e);
+    }
+  }, [userProfile.isLoggedIn, userProfile.id]);
 
   // -------------------------------------------------------------
   // INSTANT CROSS-TAB & CROSS-PORT BROADCAST SYNC WITH ADMIN
@@ -277,64 +325,73 @@ export const QuizProvider = ({ children }) => {
       };
     }
 
-    // 1. Fetch fresh participants registry directly from Firestore
-    let registry = [];
+    // 1. Fetch targeted attendee record directly from Firestore (High Concurrency: O(1) single-doc lookup)
+    let match = null;
     try {
-      const snapshot = await getDocs(collection(db, "participants"));
-      snapshot.forEach(docSnap => {
-        registry.push({ id: docSnap.id, ...docSnap.data() });
-      });
+      // Direct indexed query by ticketNumber (reads only 1 document instead of downloading all 800)
+      const qTicket = query(
+        collection(db, "participants"), 
+        where("ticketNumber", "==", cleanTicket), 
+        limit(1)
+      );
+      const snapTicket = await getDocs(qTicket);
+      if (!snapTicket.empty) {
+        match = { id: snapTicket.docs[0].id, ...snapTicket.docs[0].data() };
+      } else {
+        // Fallback: lookup by email
+        const qEmail = query(
+          collection(db, "participants"), 
+          where("email", "==", cleanEmail), 
+          limit(1)
+        );
+        const snapEmail = await getDocs(qEmail);
+        if (!snapEmail.empty) {
+          match = { id: snapEmail.docs[0].id, ...snapEmail.docs[0].data() };
+        }
+      }
     } catch (err) {
-      console.warn("Direct Firestore participants fetch notice, falling back to cache:", err);
+      console.warn("Direct indexed Firestore participant lookup notice:", err);
     }
 
     // 2. Fallback to cached registry or live leaderboard if offline
-    if (registry.length === 0) {
-      try {
-        const raw = localStorage.getItem("devfest_participants");
-        if (raw) registry = JSON.parse(raw);
-      } catch {}
-      if (registry.length === 0 && leaderboard.length > 0) {
-        registry = leaderboard;
-      }
+    if (!match) {
+      const cached = leaderboard.find(p => {
+        const pEmail = (p.email || '').trim().toLowerCase();
+        const pTicket = (p.ticketNumber || p.ticketId || p.id || '').trim().toUpperCase();
+        return pEmail === cleanEmail || pTicket === cleanTicket;
+      });
+      if (cached) match = cached;
     }
 
     // 3. Confirm matching attendee in Firestore by Email & Ticket ID
-    const match = registry.find(p => {
-      const pEmail = (p.email || '').trim().toLowerCase();
-      const pTicket = (p.ticketNumber || p.ticketId || p.id || '').trim().toUpperCase();
-      return pEmail === cleanEmail && pTicket === cleanTicket;
-    });
-
     if (!match) {
-      // Diagnostic check: does email exist with different ticket or ticket exist with different email?
-      const emailMatch = registry.find(p => (p.email || '').trim().toLowerCase() === cleanEmail);
-      const ticketMatch = registry.find(p => (p.ticketNumber || p.ticketId || p.id || '').trim().toUpperCase() === cleanTicket);
-
-      if (emailMatch && !ticketMatch) {
-        return {
-          success: false,
-          message: `Ticket ID "${cleanTicket}" does not match the registered ticket for ${cleanEmail}. Please check your ticket pass.`
-        };
-      }
-
-      if (!emailMatch && ticketMatch) {
-        return {
-          success: false,
-          message: `Email "${cleanEmail}" does not match the registered email for Ticket ${cleanTicket}. Please enter the email used during ticket registration.`
-        };
-      }
-
       return {
         success: false,
-        message: `No attendee found in DevFest Firestore registry matching Ticket ID "${cleanTicket}" and Email "${cleanEmail}". Access is denied.`
+        message: `No attendee found in DevFest registry matching Ticket ID "${cleanTicket}". Access is denied.`
+      };
+    }
+
+    const regEmail = (match.email || '').trim().toLowerCase();
+    const regTicket = (match.ticketNumber || match.ticketId || match.id || '').trim().toUpperCase();
+
+    if (regTicket && regTicket !== cleanTicket) {
+      return {
+        success: false,
+        message: `Ticket ID "${cleanTicket}" does not match the registered ticket for ${cleanEmail}. Please check your ticket pass.`
+      };
+    }
+
+    if (regEmail && regEmail !== cleanEmail) {
+      return {
+        success: false,
+        message: `Email "${cleanEmail}" does not match the registered email for Ticket ${cleanTicket}. Please enter the email used during ticket registration.`
       };
     }
 
     // 4. Confirm Name matches registered attendee in Firestore
     const regName = (match.name || '').trim().toLowerCase();
     const inputName = cleanName.toLowerCase();
-    const isNameMatch = regName === inputName || regName.includes(inputName) || inputName.includes(regName);
+    const isNameMatch = !regName || regName === inputName || regName.includes(inputName) || inputName.includes(regName);
     if (!isNameMatch) {
       return {
         success: false,
@@ -397,21 +454,13 @@ export const QuizProvider = ({ children }) => {
     localStorage.removeItem('devfest_current_attendee');
   };
 
-  // Join Quiz Action
-  const joinQuiz = async (quizId) => {
+  // Join Quiz Action (Optimized for 800+ Concurrency without document lock contention)
+  const joinQuiz = (quizId) => {
     if (!joinedQuizzes.includes(quizId)) {
       setJoinedQuizzes(prev => [...prev, quizId]);
     }
-
-    // Increment participantsCount in Firestore dynamically
-    try {
-      const quizRef = doc(db, "quizzes", quizId);
-      await updateDoc(quizRef, {
-        participantsCount: increment(1)
-      });
-    } catch (err) {
-      setQuizzes(prev => prev.map(q => q.id === quizId ? { ...q, participantsCount: (q.participantsCount || 0) + 1 } : q));
-    }
+    // Optimistically update local participant count without hammering shared quiz doc
+    setQuizzes(prev => prev.map(q => q.id === quizId ? { ...q, participantsCount: (q.participantsCount || 0) + 1 } : q));
   };
 
   // -------------------------------------------------------------

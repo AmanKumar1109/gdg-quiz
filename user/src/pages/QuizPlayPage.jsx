@@ -220,7 +220,7 @@ export const QuizPlayPage = () => {
     setIsAnswerSubmitted(true);
 
     const currentQ = questions[currentIdx];
-    const isCorrect = optionIdx === currentQ.correctAnswer;
+    const isCorrect = (currentQ?._token && btoa(`gdg_${optionIdx}_${currentIdx * 7 + 13}`) === currentQ._token) || (optionIdx === currentQ?.correctAnswer);
 
     if (isCorrect) {
       setQuizEarnedScore(prev => prev + 100);

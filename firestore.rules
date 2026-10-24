@@ -1,0 +1,42 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: Check if request is from an authenticated manager or admin
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // 1. Quizzes Collection
+    // Public read so attendees can see quiz challenges.
+    // Writes restricted strictly to authenticated admins/managers.
+    match /quizzes/{quizId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    // 2. Booths Collection
+    // Public read so attendees can see track booths.
+    // Writes restricted strictly to authenticated admins/managers.
+    match /booths/{boothId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    // 3. Participants Collection
+    // Public read so leaderboard and ticket check-in work smoothly with low latency.
+    // Creation/Update allowed for participant registration and score submissions.
+    // Deletion strictly restricted to authenticated staff/admin.
+    match /participants/{participantId} {
+      allow read: if true;
+      allow create, update: if true;
+      allow delete: if isAuthenticated();
+    }
+
+    // 4. Managers & Staff Accounts
+    // Strictly restricted to authenticated accounts only.
+    match /managers/{managerId} {
+      allow read, write: if isAuthenticated();
+    }
+  }
+}

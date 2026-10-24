@@ -40,10 +40,10 @@ export const QuizListPage = () => {
 
 
         {/* Main Hero Headline */}
-        <h1 className="text-4xl sm:text-6xl lg:text-7xl font-black text-black tracking-tight leading-[1.08] mb-6 max-w-4xl mx-auto">
+        <h1 className="text-3xl sm:text-5xl lg:text-7xl font-black text-black tracking-tight leading-[1.22] sm:leading-tight mb-6 max-w-4xl mx-auto">
           Crack the Code.{' '}
-          <span className="relative inline-block">
-            <span className="relative z-10 px-3 py-1 bg-[#FFE600] border-3 border-black rounded-2xl shadow-[4px_4px_0px_0px_#000]">
+          <span className="inline-block mt-1 sm:mt-0 align-middle">
+            <span className="inline-block px-3 sm:px-4 py-0.5 sm:py-1 bg-[#FFE600] border-3 border-black rounded-2xl shadow-[3px_3px_0px_0px_#000] sm:shadow-[4px_4px_0px_0px_#000]">
               Win the Glory.
             </span>
           </span>
